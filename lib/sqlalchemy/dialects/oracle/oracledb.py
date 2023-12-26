@@ -51,8 +51,15 @@ like the ``lib_dir`` path, a dict may be passed to this parameter, as in::
 """  # noqa
 import re
 
+from sqlalchemy import util
+from sqlalchemy.connectors.asyncio import AsyncAdapt_dbapi_connection
+from sqlalchemy.connectors.asyncio import AsyncAdapt_dbapi_cursor
+from sqlalchemy.dialects.oracle.base import OracleDialect
 from .cx_oracle import OracleDialect_cx_oracle as _OracleDialect_cx_oracle
 from ... import exc
+from ... import pool
+from ...util.concurrency import await_fallback
+from ...util.concurrency import await_only
 
 
 class OracleDialect_oracledb(_OracleDialect_cx_oracle):
@@ -89,6 +96,10 @@ class OracleDialect_oracledb(_OracleDialect_cx_oracle):
         return oracledb
 
     @classmethod
+    def get_async_dialect_cls(cls, url):
+        return OracleDialectAsync_oracledb
+
+    @classmethod
     def is_thin_mode(cls, connection):
         return connection.connection.dbapi_connection.thin
 
@@ -107,4 +118,130 @@ class OracleDialect_oracledb(_OracleDialect_cx_oracle):
             )
 
 
+class AsyncAdapt_oracledb_cursor(AsyncAdapt_dbapi_cursor):
+    __slots__ = ()
+
+    @property
+    def outputtypehandler(self):
+        return self._cursor.outputtypehandler
+
+    @outputtypehandler.setter
+    def outputtypehandler(self, value):
+        self._cursor.outputtypehandler = value
+
+    def close(self):
+        self._rows.clear()
+        self._cursor.close()
+
+
+class AsyncAdapt_oracledb_connection(AsyncAdapt_dbapi_connection):
+    __slots__ = ()
+    _cursor_cls = AsyncAdapt_oracledb_cursor
+
+    @property
+    def autocommit(self):
+        return self._connection.autocommit
+
+    @autocommit.setter
+    def autocommit(self, value: bool):
+        self._connection.autocommit = value
+
+    @property
+    def outputtypehandler(self):
+        return self._connection.outputtypehandler
+
+    @outputtypehandler.setter
+    def outputtypehandler(self, value):
+        self._connection.outputtypehandler = value
+
+    @property
+    def version(self):
+        return self._connection.version
+
+    def character_set_name(self):
+        return self._connection.encoding
+
+    def close(self):
+        self.await_(self._connection.close())
+
+
+class AsyncAdaptFallback_oracledb_connection(
+    AsyncAdapt_oracledb_connection, AsyncAdapt_dbapi_connection
+):
+    __slots__ = ()
+
+
+class AsyncAdapt_oracledb_dbapi:
+    def __init__(self, oracledb) -> None:
+        self.oracledb = oracledb
+        self.paramstyle = OracleDialect.default_paramstyle
+        for name in dir(oracledb):
+            if not hasattr(self, name):
+                setattr(self, name, getattr(oracledb, name))
+
+    def connect(self, *arg, **kw):
+        async_fallback = kw.pop("async_fallback", False)
+        creator_fn = kw.pop("async_creator_fn", self.oracledb.connect_async)
+
+        if util.asbool(async_fallback):
+            return AsyncAdaptFallback_oracledb_connection(
+                self,
+                await_fallback(creator_fn(*arg, **kw)),
+            )
+        else:
+            return AsyncAdapt_oracledb_connection(
+                self,
+                await_only(creator_fn(*arg, **kw)),
+            )
+
+
+class OracleDialectAsync_oracledb(OracleDialect_oracledb):
+    is_async = True
+    driver = "oracledb"
+
+    def __init__(
+        self,
+        auto_convert_lobs=True,
+        coerce_to_decimal=True,
+        arraysize=50,
+        encoding_errors=None,
+        **kwargs,
+    ):
+        super().__init__(
+            auto_convert_lobs,
+            coerce_to_decimal,
+            arraysize,
+            encoding_errors,
+            thick_mode=None,
+            **kwargs,
+        )
+
+    @classmethod
+    def import_dbapi(cls):
+        oracledb = __import__("oracledb")
+        # oracledb.connect = oracledb.connect_async
+        # oracledb.Connection = oracledb.AsyncConnection
+        # oracledb.ConnectionPool = oracledb.AsyncConnectionPool
+        # oracledb.LOB = oracledb.AsyncLOB
+        return AsyncAdapt_oracledb_dbapi(oracledb)
+
+    @classmethod
+    def is_thin_mode(cls, connection):
+        # Only thin mode is supported by oracledb async
+        return True
+
+    @classmethod
+    def get_pool_class(cls, url):
+        async_fallback = url.query.get("async_fallback", False)
+
+        if util.asbool(async_fallback):
+            return pool.FallbackAsyncAdaptedQueuePool
+        else:
+            return pool.AsyncAdaptedQueuePool
+
+    def _load_version(self, dbapi_module):
+        return super()._load_version(dbapi_module.oracledb)
+
+
 dialect = OracleDialect_oracledb
+dialect_async = OracleDialectAsync_oracledb

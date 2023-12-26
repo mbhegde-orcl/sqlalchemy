@@ -6,6 +6,7 @@
 # the MIT License: https://www.opensource.org/licenses/mit-license.php
 # mypy: ignore-errors
 
+from types import ModuleType
 
 from . import base  # noqa
 from . import cx_oracle  # noqa
@@ -33,7 +34,10 @@ from .base import TIMESTAMP
 from .base import VARCHAR
 from .base import VARCHAR2
 
-
+# Alias psycopg also as psycopg_async
+oracledb_async = type(
+    "oracledb_async", (ModuleType,), {"dialect": oracledb.dialect_async}
+)
 base.dialect = dialect = cx_oracle.dialect
 
 __all__ = (
